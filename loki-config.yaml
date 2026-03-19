@@ -16,7 +16,11 @@ common:
     kvstore:
       store: inmemory
 
+querier:
+  max_concurrent: 20
+
 query_range:
+  parallelise_shardable_queries: true
   results_cache:
     cache:
       embedded_cache:
@@ -41,11 +45,18 @@ limits_config:
   reject_old_samples: true
   reject_old_samples_max_age: 168h
   max_cache_freshness_per_query: 10m
-  split_queries_by_interval: 15m
+  split_queries_by_interval: 0
   ingestion_rate_mb: 10
   ingestion_burst_size_mb: 20
   max_entries_limit_per_query: 10000
+  
+  max_query_parallelism: 32
+  max_concurrent_tail_requests: 20
+  max_query_series: 10000
+  max_query_length: 721h
+  max_streams_per_user: 0
+  max_global_streams_per_user: 0
 
 table_manager:
   retention_deletes_enabled: true
-  retention_period: 720h  # 30 Days
+  retention_period: 720h
