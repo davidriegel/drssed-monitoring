@@ -1,15 +1,17 @@
 # Drssed — Monitoring
 
-GLP stack for [drssed-api](https://github.com/davidriegel/drssed-api) with real-time log aggregation, metrics visualization, and performance monitoring.
+GLP stack ([Grafana](https://grafana.com), [Loki](https://grafana.com/oss/loki/), [Promtail](https://grafana.com/docs/loki/latest/send-data/promtail/)) for [drssed-api](https://github.com/davidriegel/drssed-api): real-time log aggregation, structured query, and a curated performance dashboard.
 
 ---
 
 ## Features
 
-- **Real-time log streaming** — aggregate logs from all API containers
-- **Structured log parsing** — extract fields for querying
-- **Pre-configured Grafana dashboards** — out-of-the-box API monitoring
-- **Zero-configuration setup** — automatic setup for drssed-api
+- **Zero-config Docker discovery** — Promtail picks up every container on the host via the Docker socket; no per-service config needed.
+- **Structured JSON parsing** — request fields (`method`, `path`, `status_code`, `duration_ms`, `endpoint`, `level`, `request_id`) are extracted from the API's JSON log lines.
+- **Stable labels** — streams are keyed by `compose_project`/`compose_service` instead of fragile container-name regexes, so renames don't break queries.
+- **TSDB-backed Loki** — schema v13 / TSDB, structured-metadata ingestion enabled, compactor-based retention (30 d by default).
+- **Curated dashboard** — RPS, error rate, success rate, p50/p95/p99 latency, status-code mix, top endpoints by latency and by volume, live log tail.
+- **Hardened compose** — health-gated startup, capped Docker logs, pinned image versions.
 
 ---
 
@@ -17,189 +19,197 @@ GLP stack for [drssed-api](https://github.com/davidriegel/drssed-api) with real-
 
 ### Prerequisites
 
-- Docker
-- Docker Compose
-- [drssed-api](https://github.com/davidriegel/drssed-api) running with `FLASK_ENV=production`
+- Docker + Docker Compose
+- [drssed-api](https://github.com/davidriegel/drssed-api) running with `FLASK_ENV=production` (emits structured JSON logs)
 
 ### Installation
-
-Clone the repository:
 
 ```bash
 git clone https://github.com/davidriegel/drssed-monitoring.git
 cd drssed-monitoring
-```
-
-Start the stack:
-
-```bash
 docker compose up -d
 ```
 
-Access Grafana:
+Grafana is at <http://localhost:3000>. Default credentials `admin` / `admin` — change on first login.
 
-```
-http://localhost:3000
-```
-
-**Default credentials:**
-- Username: `admin`
-- Password: `admin`
-
-⚠️ **Change the password on first login**
-
-The pre-configured dashboard **"Drssed API Monitoring"** is automatically available under **Dashboards** → **General**.
+The **Drssed API Monitoring** dashboard is auto-provisioned and reloads from disk every 10 s.
 
 ---
 
-## Dashboard Overview
+## Dashboard
 
-The included dashboard provides comprehensive API monitoring:
+### Overview row (top of dashboard, range-aware)
+| Panel | What it shows |
+|---|---|
+| **Total Requests** | Total request count over the selected time range |
+| **Errors** | Count of `level="ERROR"` lines, background-colored when > 0 |
+| **Success Rate** | Share of `2xx`/`3xx` responses; red below 90, green ≥ 99 |
+| **P95 Response Time** | Average of per-stream p95 over the last 5 min |
+| **Current Throughput** | Requests/s over the last minute |
 
-### Overview Section
-- **Total Requests** — Request volume over the last 5 minutes
-- **Error Count** — Number of errors with threshold indicators
-- **Success Rate** — Percentage of 2xx responses
-- **P95 Response Time** — 95th percentile latency
+### Performance row
+- **Request Rate by Method** — `sum by (method) (rate(...))`, one line per HTTP verb.
+- **Response Time Percentiles** — p50 (green), p95 (yellow), p99 (red); each is `avg(quantile_over_time(...))` so high-cardinality endpoint labels don't fan out into dozens of lines.
 
-### Performance Section
-- **Request Rate by Method** — HTTP method distribution over time
-- **Response Time Percentiles** — P50, P95, P99 latency tracking
-- **Top 10 Slowest Endpoints** — Average response time by endpoint
-- **Status Code Distribution** — HTTP status code breakdown
+### Endpoint & status row
+- **Status Codes Over Time** — stacked timeseries, 2xx green / 3xx blue / 4xx orange / 5xx red.
+- **Status Code Distribution** — donut with the same color scheme.
+- **Top 10 Slowest Endpoints (avg ms)** — bar chart, continuous green→red color scale.
+- **Top 10 Endpoints by Volume** — bar chart, continuous blue→purple color scale.
 
-### Logs Section
-- **Live Logs** — Real-time log stream from all API containers
-- **Error Logs Only** — Filtered view of ERROR level logs
+### Logs row
+- **Live Logs** — full JSON, pretty-printed and line-wrapped.
+- **Errors & Warnings** — filtered to `level=~"ERROR|WARNING"`.
 
-All panels update automatically every 30 seconds.
+Default time range is **last 1 h**, refresh **30 s**, shared crosshair tooltip across panels.
 
 ---
 
 ## Integration with drssed-api
 
-### Enable JSON Logging
+### JSON logging
 
-The monitoring stack works best with structured JSON logs. In drssed-api, set:
-
-```env
-# drssed-api/.env
-FLASK_ENV=production
-LOG_LEVEL=INFO
-```
-
-Production mode automatically outputs JSON-formatted logs:
+Set `FLASK_ENV=production` in `drssed-api/.env`. Production mode emits log lines like:
 
 ```json
 {
-  "timestamp": "2026-03-18T20:47:42.373646Z",
+  "timestamp": "2026-05-11T19:04:11.251496Z",
   "level": "INFO",
   "message": "GET /ping → 200 (0.32ms)",
-  "endpoint": "main.ping_reachablility",
+  "endpoint": "main.ping_reachability",
   "method": "GET",
   "status_code": 200,
   "duration_ms": 0.32,
-  "ip": "172.21.0.1"
+  "request_id": "…"
 }
 ```
 
-### Automatic Discovery
+Promtail extracts these fields. The `pipeline_stages` are gated on `compose_service="api"`, so non-API containers (mysql, redis) are still shipped as raw lines without futile JSON parsing.
 
-No manual configuration required. The monitoring stack automatically discovers and monitors all Docker containers via the shared `loki` network.
+### Automatic discovery
 
-### Log Query Examples
+No host-network sharing or shared compose project required — Promtail uses the Docker socket (read-only) to enumerate containers and reads their JSON log files directly from `/var/lib/docker/containers`. Self-logs from `loki`, `promtail`, and `cloudflare-cloudflare-ddns-1` are dropped at the pipeline stage to keep the index small.
 
-Use these LogQL queries in Grafana Explore for custom analysis:
+---
+
+## LogQL Examples
+
+Run these in **Explore** → Loki datasource.
 
 **All API logs:**
 ```logql
-{container=~".*drssed.*api.*"}
+{compose_project="drssed-backend",compose_service="api"}
 ```
 
-**Error logs only:**
+**Errors only:**
 ```logql
-{container=~".*drssed.*api.*"} | json | level="ERROR"
+{compose_project="drssed-backend",compose_service="api"} | json | level="ERROR"
 ```
 
-**Slow requests (> 500ms):**
+**Slow requests (> 500 ms):**
 ```logql
-{container=~".*drssed.*api.*"} | json | duration_ms > 500
+{compose_project="drssed-backend",compose_service="api"} | json | duration_ms > 500
 ```
 
-**Requests by endpoint:**
+**Request rate per endpoint:**
 ```logql
-sum by (endpoint) (rate({container=~".*drssed.*api.*"} | json [5m]))
+sum by (endpoint) (rate({compose_project="drssed-backend",compose_service="api"} | json | endpoint!="" [1m]))
+```
+
+**5xx rate:**
+```logql
+sum(rate({compose_project="drssed-backend",compose_service="api"} | json | status_code >= 500 [5m]))
+```
+
+**P99 latency, single line:**
+```logql
+avg(quantile_over_time(0.99, {compose_project="drssed-backend",compose_service="api"} | json | __error__="" | unwrap duration_ms [5m]))
 ```
 
 ---
 
 ## Tech Stack
 
-| Component | Technology |
-|-----------|-----------|
-| Visualization | Grafana |
-| Log Aggregation | Loki |
-| Log Collection | Promtail |
+| Component | Version | Purpose |
+|---|---|---|
+| Grafana | 11.4.0 | Visualization, dashboard provisioning |
+| Loki | 3.3.2 | Log storage (TSDB v13 schema, filesystem chunks) |
+| Promtail | 3.3.2 | Docker SD log collection |
 
 ---
 
 ## Configuration
 
-### Log Retention
+### Log retention
 
-Modify retention period in `loki-config.yaml`:
+Retention is enforced by the Loki compactor. Adjust in `loki-config.yaml`:
 
 ```yaml
-table_manager:
-  retention_period: 720h  # 30 days (in hours)
+limits_config:
+  retention_period: 720h   # 30 days
+
+compactor:
+  retention_enabled: true
+  compaction_interval: 10m
 ```
 
-Apply changes:
+Apply with `docker compose up -d` (no full restart needed; Loki re-reads on container restart).
+
+### Scraping additional services
+
+Promtail already collects every container the Docker socket can see. To drop a noisy one, add it to the existing drop selector in `promtail-config.yaml`:
+
+```yaml
+pipeline_stages:
+  - match:
+      selector: '{container=~"cloudflare-cloudflare-ddns-1|promtail|loki|my-noisy-thing"}'
+      action: drop
+```
+
+To run JSON extraction for another service, add a second `match` block selecting on its `compose_service`.
+
+---
+
+## Customizing the dashboard
+
+The provisioned dashboard is editable in the UI:
+
+1. Open **Drssed API Monitoring**.
+2. Edit panels, click **Save dashboard**.
+3. **Share** → **Export** → **Save to file**.
+4. Replace `dashboards/drssed-api-dashboard.json` — Grafana picks it up within ~10 s without a restart.
+
+---
+
+## Operations
+
+### Health
+
+Both Loki and Grafana have HTTP health checks defined in compose; Promtail and Grafana wait for Loki to report ready before starting.
+
 ```bash
-docker compose down
-docker compose up -d
+docker compose ps
+curl -s http://localhost:3100/ready
+curl -s http://localhost:3000/api/health
 ```
 
-### Monitor Additional Services
+### Verifying ingestion
 
-The stack automatically monitors all Docker containers. To filter specific services, edit `promtail-config.yaml`:
+```bash
+curl -s "http://localhost:3100/loki/api/v1/label/compose_service/values"
+# {"status":"success","data":["api","grafana","mysql","redis", ...]}
 
-```yaml
-scrape_configs:
-  - job_name: docker
-    relabel_configs:
-      - source_labels: ['__meta_docker_container_name']
-        regex: '/(.*drssed.*|.*your-service.*)'
-        target_label: 'container'
+curl -sG "http://localhost:3100/loki/api/v1/query" \
+  --data-urlencode 'query=sum(rate({compose_service="api"} | json | __error__="" [1m]))'
 ```
 
----
+If `data` is empty for `compose_service`, the API container isn't labeled by Docker Compose — confirm the API is started via `docker compose`, not a bare `docker run`.
+
+### Container log caps
+
+Each container in this stack logs through `json-file` with `max-size: 10m, max-file: 3` — i.e. 30 MB max per container. The Loki data volume (`loki-data`) is the only thing that grows with traffic.
 
 ---
-
-## Customization
-
-### Modify the Dashboard
-
-The provisioned dashboard is fully editable:
-
-1. Open **Drssed API Monitoring** dashboard
-2. Edit panels as needed
-3. Click **Save dashboard**
-4. Export via **Share** → **Export** → **Save to file**
-5. Replace `dashboards/drssed-api-dashboard.json`
-
-Changes persist across container restarts.
-
-### Add Custom Panels
-
-Create new visualizations using LogQL queries:
-
-1. Click **Add** → **Visualization**
-2. Select **Loki** datasource
-3. Enter LogQL query
-4. Choose visualization type
-5. Save panel
 
 ## Related
 
@@ -212,16 +222,6 @@ Create new visualizations using LogQL queries:
 ## Resources
 
 - [Loki Documentation](https://grafana.com/docs/loki/latest/)
-- [LogQL Query Language](https://grafana.com/docs/loki/latest/logql/)
-- [Grafana Dashboards](https://grafana.com/grafana/dashboards/)
-- [Promtail Configuration](https://grafana.com/docs/loki/latest/clients/promtail/configuration/)
-
----
-
-## About the Project
-
-This monitoring stack demonstrates observability practices for containerized microservices. It showcases automated log aggregation, real-time metrics visualization, and performance monitoring using Grafana and Loki.
-
-Built as part of the Drssed ecosystem to enable data-driven performance optimization and proactive issue detection.
-
----
+- [LogQL Query Language](https://grafana.com/docs/loki/latest/query/)
+- [Promtail Configuration](https://grafana.com/docs/loki/latest/send-data/promtail/configuration/)
+- [Grafana Dashboards](https://grafana.com/docs/grafana/latest/dashboards/)

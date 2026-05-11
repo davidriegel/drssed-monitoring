@@ -3,36 +3,52 @@ networks:
     name: loki
     driver: bridge
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   loki:
-    image: grafana/loki:2.9.3
+    image: grafana/loki:3.3.2
     container_name: loki
     ports:
       - "3100:3100"
     command: -config.file=/etc/loki/local-config.yaml
     volumes:
-      - ./loki-config.yaml:/etc/loki/local-config.yaml
+      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
       - loki-data:/loki
     networks:
       - loki
     restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready | grep -q 'ready' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   promtail:
-    image: grafana/promtail:2.9.3
+    image: grafana/promtail:3.3.2
     container_name: promtail
     volumes:
-      - ./promtail-config.yaml:/etc/promtail/config.yaml
+      - ./promtail-config.yaml:/etc/promtail/config.yaml:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - promtail-positions:/tmp
     command: -config.file=/etc/promtail/config.yaml
     networks:
       - loki
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
-      - loki
+      loki:
+        condition: service_healthy
 
   grafana:
-    image: grafana/grafana:10.2.3
+    image: grafana/grafana:11.4.0
     container_name: grafana
     ports:
       - "3000:3000"
@@ -42,17 +58,28 @@ services:
       - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
       - GF_AUTH_ANONYMOUS_ENABLED=false
       - GF_SERVER_ROOT_URL=http://localhost:3000
+      - GF_FEATURE_TOGGLES_ENABLE=lokiLogsDataplane
+      - GF_LOG_LEVEL=warn
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
-      - ./provisioning/dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml
-      - ./dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - ./provisioning/dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+      - ./dashboards:/etc/grafana/provisioning/dashboards/files:ro
     networks:
       - loki
     restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q 'ok' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
-      - loki
+      loki:
+        condition: service_healthy
 
 volumes:
   loki-data:
   grafana-data:
+  promtail-positions:
